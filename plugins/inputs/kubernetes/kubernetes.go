@@ -48,6 +48,17 @@ type Kubernetes struct {
 	httpClient  *http.Client
 }
 
+type NodeInfo struct {
+	Node *v1.Node
+	URL string
+	Labels map[string]string
+}
+
+func newNodeInfo(node *v1.Node, url string, labels map[string]string) NodeInfo {
+	n := NodeInfo{Node: node, URL: url, Labels: labels}
+	return n
+}
+
 func (*Kubernetes) SampleConfig() string {
 	return sampleConfig
 }
@@ -77,56 +88,76 @@ func (k *Kubernetes) Init() error {
 
 func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
 	if k.URL != "" {
-		acc.AddError(k.gatherSummary(k.URL, acc))
+		labels := make(map[string]string)
+		acc.AddError(k.gatherSummary(k.URL, labels, acc))
 		return nil
 	}
 
 	var wg sync.WaitGroup
-	nodeBaseURLs, err := getNodeURLs(k.Log)
+
+	nodes, err := getNodes()
 	if err != nil {
 		return err
 	}
 
-	for _, url := range nodeBaseURLs {
+	nodeInfoList, err := getNodeInfoList(nodes, k.Log)
+
+	if err != nil {
+		return err
+	}
+
+	for _, ni := range nodeInfoList {
 		wg.Add(1)
 		go func(url string) {
 			defer wg.Done()
-			acc.AddError(k.gatherSummary(url, acc))
-		}(url)
+			acc.AddError(k.gatherSummary(ni.URL, ni.Labels, acc))
+		}(ni.URL)
 	}
 	wg.Wait()
 
 	return nil
 }
 
-func getNodeURLs(log telegraf.Logger) ([]string, error) {
+func getNodes() (*v1.NodeList, error) {
+
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, err
 	}
+
 	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
 
 	nodes, err := client.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+
 	if err != nil {
+		//panic(err.Error())
 		return nil, err
 	}
+	return nodes, nil
+}
 
-	nodeUrls := make([]string, 0, len(nodes.Items))
-	for i := range nodes.Items {
-		n := &nodes.Items[i]
+func getNodeInfoList(nl *v1.NodeList, log telegraf.Logger) ([]NodeInfo, error) {
+
+	nodeInfoList := make([]NodeInfo, 0, len(nl.Items))
+
+	for i := range nl.Items {
+		n := &nl.Items[i]
 
 		address := getNodeAddress(n.Status.Addresses)
 		if address == "" {
 			log.Warnf("Unable to node addresses for Node %q", n.Name)
 			continue
 		}
-		nodeUrls = append(nodeUrls, "https://"+address+":10250")
+		nodeurl := "https://"+address+":10250"
+		labels := n.GetLabels()
+		ni := newNodeInfo(n, nodeurl, labels)
+		nodeInfoList = append(nodeInfoList, ni)
 	}
 
-	return nodeUrls, nil
+	return nodeInfoList, nil
 }
 
 // Prefer internal addresses, if none found, use ExternalIP
@@ -145,7 +176,7 @@ func getNodeAddress(addresses []v1.NodeAddress) string {
 	return ""
 }
 
-func (k *Kubernetes) gatherSummary(baseURL string, acc telegraf.Accumulator) error {
+func (k *Kubernetes) gatherSummary(baseURL string, labels map[string]string, acc telegraf.Accumulator) error {
 	summaryMetrics := &summaryMetrics{}
 	err := k.loadJSON(baseURL+"/stats/summary", summaryMetrics)
 	if err != nil {
@@ -157,7 +188,7 @@ func (k *Kubernetes) gatherSummary(baseURL string, acc telegraf.Accumulator) err
 		return err
 	}
 	buildSystemContainerMetrics(summaryMetrics, acc)
-	buildNodeMetrics(summaryMetrics, acc, k.NodeMetricName)
+	buildNodeMetrics(summaryMetrics, labels, k.labelFilter, acc, k.NodeMetricName)
 	buildPodMetrics(summaryMetrics, podInfos, k.labelFilter, acc)
 	return nil
 }
@@ -184,10 +215,17 @@ func buildSystemContainerMetrics(summaryMetrics *summaryMetrics, acc telegraf.Ac
 	}
 }
 
-func buildNodeMetrics(summaryMetrics *summaryMetrics, acc telegraf.Accumulator, metricName string) {
+func buildNodeMetrics(summaryMetrics *summaryMetrics, labels map[string]string, labelFilter filter.Filter, acc telegraf.Accumulator, metricName string) {
 	tags := map[string]string{
 		"node_name": summaryMetrics.Node.NodeName,
 	}
+
+	for k, v := range labels {
+		if labelFilter.Match(k) {
+			tags[k] = v
+		}
+	}
+
 	fields := make(map[string]interface{})
 	fields["cpu_usage_nanocores"] = summaryMetrics.Node.CPU.UsageNanoCores
 	fields["cpu_usage_core_nanoseconds"] = summaryMetrics.Node.CPU.UsageCoreNanoSeconds
