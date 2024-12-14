@@ -9,8 +9,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
+	"regexp"
+	"sync"
 
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,6 +27,7 @@ import (
 
 //go:embed sample.conf
 var sampleConfig string
+var ipRegex = regexp.MustCompile("https://([0-9.]+):[0-9]+")
 
 const (
 	defaultServiceAccountPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -93,24 +95,31 @@ func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
 		return err
 	}
 
-	nodeInfoList, err := getNodeInfoList(nodes, k.Log)
+	nodeInfoMap, err := getNodeInfoMap(nodes, k.Log)
 
 	if err != nil {
 		return err
 	}
 
 	if k.URL != "" {
-        k.Log.Infof("k.URL: %s", k.URL)
-		labels := make(map[string]string)
-		acc.AddError(k.gatherSummary(k.URL, labels, acc, k.Log))
+		k.Log.Infof("k.URL: %s", k.URL)
+		name := urlToName(k.URL, k.Log)
+		node, ok := nodeInfoMap[name]
+		if ok {
+			labels := node.Labels
+			acc.AddError(k.gatherSummary(k.URL, labels, acc, k.Log))
+		}else {
+			labels := make(map[string]string)
+			acc.AddError(k.gatherSummary(k.URL, labels, acc, k.Log))
+		}
 		return nil
 	}else {
-        k.Log.Info("k.URL is empty")
-    }
+		k.Log.Info("k.URL is empty")
+	}
 
 	var wg sync.WaitGroup
 
-	for _, ni := range nodeInfoList {
+	for _, ni := range nodeInfoMap {
 		wg.Add(1)
 		go func(url string) {
 			defer wg.Done()
@@ -143,13 +152,15 @@ func getNodes() (*v1.NodeList, error) {
 	return nodes, nil
 }
 
-func getNodeInfoList(nl *v1.NodeList, log telegraf.Logger) ([]NodeInfo, error) {
+func getNodeInfoMap(nl *v1.NodeList, log telegraf.Logger) (map[string]NodeInfo, error) {
 
-	nodeInfoList := make([]NodeInfo, 0, len(nl.Items))
+	// nodeInfoList := make([]NodeInfo, 0, len(nl.Items))
+	nodeInfoMap := make(map[string]NodeInfo)
 
 	for i := range nl.Items {
 		n := &nl.Items[i]
-        log.Infof("getNodeInfoList(), node: %v", n)
+		name := n.Name
+		log.Infof("getNodeInfoList(), node: %s", name)
 
 		address := getNodeAddress(n.Status.Addresses)
 		if address == "" {
@@ -158,15 +169,16 @@ func getNodeInfoList(nl *v1.NodeList, log telegraf.Logger) ([]NodeInfo, error) {
 		}
 		nodeurl := "https://"+address+":10250"
 		labels := n.GetLabels()
-        log.Infof("getNodeInfoList(), %d labels found", len(labels))
+		log.Infof("getNodeInfoList(), %d labels found", len(labels))
 		for k, v := range labels {
 			log.Infof("getNodeInfoList(): label: %s -> %s", k, v)
 		}
 		ni := newNodeInfo(n, nodeurl, labels)
-		nodeInfoList = append(nodeInfoList, ni)
+		// nodeInfoList = append(nodeInfoList, ni)
+		nodeInfoMap[name] = ni
 	}
 
-	return nodeInfoList, nil
+	return nodeInfoMap, nil
 }
 
 // Prefer internal addresses, if none found, use ExternalIP
@@ -191,7 +203,7 @@ func (k *Kubernetes) gatherSummary(baseURL string, labels map[string]string, acc
 	if err != nil {
 		return err
 	}
-    log.Infof("gatherSummary(): loadJSON(%s)", (baseURL+"/stats/summary"))
+	log.Infof("gatherSummary(): loadJSON(%s)", (baseURL+"/stats/summary"))
 
 	podInfos, err := k.gatherPodInfo(baseURL)
 	if err != nil {
@@ -233,7 +245,7 @@ func buildNodeMetrics(summaryMetrics *summaryMetrics,
 
 	tags := map[string]string{
 		"node_name": summaryMetrics.Node.NodeName,
-    }
+	}
 	log.Infof("buildNodeMetrics(): got nodename: %s from summaryMetrics", summaryMetrics.Node.NodeName)
 
 	for k, v := range labels {
@@ -422,4 +434,27 @@ func init() {
 			LabelExclude: []string{"*"},
 		}
 	})
+}
+
+func urlToName(url string, log telegraf.Logger) string {
+
+	res := ipRegex.FindStringSubmatch(url)
+
+	log.Infof("urlToName(): ipRegex returned: %v", res)
+	if res != nil {
+		if len(res) == 2 {
+			parts := strings.Split(res[1], ".")
+			name := fmt.Sprintf("ip-%s-%s-%s-%s.ec2.internal",
+				parts[0],
+				parts[1],
+				parts[2],
+				parts[3])
+			log.Infof("urlToName(): found Node name: %v", res)
+			return name
+		}else {
+			return ""
+		}
+	}else {
+		return ""
+	}
 }
