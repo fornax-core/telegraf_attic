@@ -87,13 +87,6 @@ func (k *Kubernetes) Init() error {
 }
 
 func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
-	if k.URL != "" {
-		labels := make(map[string]string)
-		acc.AddError(k.gatherSummary(k.URL, labels, acc))
-		return nil
-	}
-
-	var wg sync.WaitGroup
 
 	nodes, err := getNodes()
 	if err != nil {
@@ -106,11 +99,22 @@ func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
 		return err
 	}
 
+	if k.URL != "" {
+        k.Log.Infof("k.URL: %s", k.URL)
+		labels := make(map[string]string)
+		acc.AddError(k.gatherSummary(k.URL, labels, acc, k.Log))
+		return nil
+	}else {
+        k.Log.Info("k.URL is empty")
+    }
+
+	var wg sync.WaitGroup
+
 	for _, ni := range nodeInfoList {
 		wg.Add(1)
 		go func(url string) {
 			defer wg.Done()
-			acc.AddError(k.gatherSummary(ni.URL, ni.Labels, acc))
+			acc.AddError(k.gatherSummary(ni.URL, ni.Labels, acc, k.Log))
 		}(ni.URL)
 	}
 	wg.Wait()
@@ -145,6 +149,7 @@ func getNodeInfoList(nl *v1.NodeList, log telegraf.Logger) ([]NodeInfo, error) {
 
 	for i := range nl.Items {
 		n := &nl.Items[i]
+        log.Infof("getNodeInfoList(), node: %v", n)
 
 		address := getNodeAddress(n.Status.Addresses)
 		if address == "" {
@@ -153,6 +158,10 @@ func getNodeInfoList(nl *v1.NodeList, log telegraf.Logger) ([]NodeInfo, error) {
 		}
 		nodeurl := "https://"+address+":10250"
 		labels := n.GetLabels()
+        log.Infof("getNodeInfoList(), %d labels found", len(labels))
+		for k, v := range labels {
+			log.Infof("getNodeInfoList(): label: %s -> %s", k, v)
+		}
 		ni := newNodeInfo(n, nodeurl, labels)
 		nodeInfoList = append(nodeInfoList, ni)
 	}
@@ -176,19 +185,20 @@ func getNodeAddress(addresses []v1.NodeAddress) string {
 	return ""
 }
 
-func (k *Kubernetes) gatherSummary(baseURL string, labels map[string]string, acc telegraf.Accumulator) error {
+func (k *Kubernetes) gatherSummary(baseURL string, labels map[string]string, acc telegraf.Accumulator, log telegraf.Logger) error {
 	summaryMetrics := &summaryMetrics{}
 	err := k.loadJSON(baseURL+"/stats/summary", summaryMetrics)
 	if err != nil {
 		return err
 	}
+    log.Infof("gatherSummary(): loadJSON(%s)", (baseURL+"/stats/summary"))
 
 	podInfos, err := k.gatherPodInfo(baseURL)
 	if err != nil {
 		return err
 	}
 	buildSystemContainerMetrics(summaryMetrics, acc)
-	buildNodeMetrics(summaryMetrics, labels, k.labelFilter, acc, k.NodeMetricName)
+	buildNodeMetrics(summaryMetrics, labels, k.labelFilter, acc, k.NodeMetricName, log)
 	buildPodMetrics(summaryMetrics, podInfos, k.labelFilter, acc)
 	return nil
 }
@@ -215,13 +225,21 @@ func buildSystemContainerMetrics(summaryMetrics *summaryMetrics, acc telegraf.Ac
 	}
 }
 
-func buildNodeMetrics(summaryMetrics *summaryMetrics, labels map[string]string, labelFilter filter.Filter, acc telegraf.Accumulator, metricName string) {
+func buildNodeMetrics(summaryMetrics *summaryMetrics,
+						labels map[string]string,
+						labelFilter filter.Filter,
+						acc telegraf.Accumulator,
+						metricName string, log telegraf.Logger) {
+
 	tags := map[string]string{
 		"node_name": summaryMetrics.Node.NodeName,
-	}
+    }
+	log.Infof("buildNodeMetrics(): got nodename: %s from summaryMetrics", summaryMetrics.Node.NodeName)
 
 	for k, v := range labels {
+		log.Infof("buildNodeMetrics(): label: %s -> %s", k, v)
 		if labelFilter.Match(k) {
+			log.Infof("buildNodeMetrics(): filter matched: %s -> %s", k, v)
 			tags[k] = v
 		}
 	}
