@@ -12,6 +12,8 @@ import (
 	"time"
 	"regexp"
 	"sync"
+	"bytes"
+	"io"
 
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,6 +30,7 @@ import (
 //go:embed sample.conf
 var sampleConfig string
 var ipRegex = regexp.MustCompile("https://([0-9.]+):[0-9]+")
+var invalid_sql_chars, _ = regexp.Compile(`[^_a-z0-9]+`)
 
 const (
 	defaultServiceAccountPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -43,6 +46,8 @@ type Kubernetes struct {
 	LabelExclude      []string        `toml:"label_exclude"`
 	ResponseTimeout   config.Duration `toml:"response_timeout"`
 	Log               telegraf.Logger `toml:"-"`
+	ConvertLabels     bool            `toml:"convert_labels"`
+	NodeLabels        bool            `toml:"node_labels"`
 
 	tls.ClientConfig
 
@@ -57,7 +62,9 @@ type NodeInfo struct {
 }
 
 func newNodeInfo(node *v1.Node, url string, labels map[string]string) NodeInfo {
+
 	n := NodeInfo{Node: node, URL: url, Labels: labels}
+
 	return n
 }
 
@@ -85,6 +92,15 @@ func (k *Kubernetes) Init() error {
 		k.NodeMetricName = "kubernetes_node"
 	}
 
+	if k.ConvertLabels {
+		k.Log.Debugf("k.ConvertLabels true")
+	}
+
+	if k.NodeLabels {
+		k.Log.Debugf("k.NodeLabels true")
+	}
+
+	k.Log.Debugf("k.Init() k = %+v", k)
 	return nil
 }
 
@@ -102,7 +118,7 @@ func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
 	}
 
 	if k.URL != "" {
-		k.Log.Infof("k.URL: %s", k.URL)
+		k.Log.Debugf("k.URL: %s", k.URL)
 		name := urlToName(k.URL, k.Log)
 		node, ok := nodeInfoMap[name]
 		if ok {
@@ -154,13 +170,12 @@ func getNodes() (*v1.NodeList, error) {
 
 func getNodeInfoMap(nl *v1.NodeList, log telegraf.Logger) (map[string]NodeInfo, error) {
 
-	// nodeInfoList := make([]NodeInfo, 0, len(nl.Items))
 	nodeInfoMap := make(map[string]NodeInfo)
 
 	for i := range nl.Items {
 		n := &nl.Items[i]
 		name := n.Name
-		log.Infof("getNodeInfoList(), node: %s", name)
+		log.Debugf("getNodeInfoList(), node: %s", name)
 
 		address := getNodeAddress(n.Status.Addresses)
 		if address == "" {
@@ -169,12 +184,11 @@ func getNodeInfoMap(nl *v1.NodeList, log telegraf.Logger) (map[string]NodeInfo, 
 		}
 		nodeurl := "https://"+address+":10250"
 		labels := n.GetLabels()
-		log.Infof("getNodeInfoList(), %d labels found", len(labels))
+		log.Debugf("getNodeInfoList(), %d labels found", len(labels))
 		for k, v := range labels {
-			log.Infof("getNodeInfoList(): label: %s -> %s", k, v)
+			log.Debugf("getNodeInfoList(): label: %s -> %s", k, v)
 		}
 		ni := newNodeInfo(n, nodeurl, labels)
-		// nodeInfoList = append(nodeInfoList, ni)
 		nodeInfoMap[name] = ni
 	}
 
@@ -203,15 +217,15 @@ func (k *Kubernetes) gatherSummary(baseURL string, labels map[string]string, acc
 	if err != nil {
 		return err
 	}
-	log.Infof("gatherSummary(): loadJSON(%s)", (baseURL+"/stats/summary"))
+	log.Debugf("gatherSummary(): loadJSON(%s)", (baseURL+"/stats/summary"))
 
 	podInfos, err := k.gatherPodInfo(baseURL)
 	if err != nil {
 		return err
 	}
 	buildSystemContainerMetrics(summaryMetrics, acc)
-	buildNodeMetrics(summaryMetrics, labels, k.labelFilter, acc, k.NodeMetricName, log)
-	buildPodMetrics(summaryMetrics, podInfos, k.labelFilter, acc)
+	buildNodeMetrics(summaryMetrics, labels, k.labelFilter, acc, k.NodeMetricName, log, k.ConvertLabels)
+	buildPodMetrics(summaryMetrics, podInfos, k.labelFilter, acc, log, k.ConvertLabels)
 	return nil
 }
 
@@ -241,18 +255,26 @@ func buildNodeMetrics(summaryMetrics *summaryMetrics,
 						labels map[string]string,
 						labelFilter filter.Filter,
 						acc telegraf.Accumulator,
-						metricName string, log telegraf.Logger) {
+						metricName string, log telegraf.Logger,
+						convert bool) {
+
+	var converted string
 
 	tags := map[string]string{
 		"node_name": summaryMetrics.Node.NodeName,
 	}
-	log.Infof("buildNodeMetrics(): got nodename: %s from summaryMetrics", summaryMetrics.Node.NodeName)
+	log.Debugf("buildNodeMetrics(): got nodename: %s from summaryMetrics", summaryMetrics.Node.NodeName)
 
 	for k, v := range labels {
-		log.Infof("buildNodeMetrics(): label: %s -> %s", k, v)
+		log.Debugf("buildNodeMetrics(): label: %s -> %s", k, v)
 		if labelFilter.Match(k) {
-			log.Infof("buildNodeMetrics(): filter matched: %s -> %s", k, v)
-			tags[k] = v
+			log.Debugf("buildNodeMetrics(): filter matched: %s -> %s", k, v)
+			if convert {
+				converted = invalid_sql_chars.ReplaceAllString(k, "_") 
+				tags[converted] = v
+			}else {
+				tags[k] = v
+			}
 		}
 	}
 
@@ -291,6 +313,8 @@ func (k *Kubernetes) gatherPodInfo(baseURL string) ([]item, error) {
 
 func (k *Kubernetes) loadJSON(url string, v interface{}) error {
 	var req, err = http.NewRequest("GET", url, nil)
+    var b bytes.Buffer
+
 	if err != nil {
 		return err
 	}
@@ -329,9 +353,14 @@ func (k *Kubernetes) loadJSON(url string, v interface{}) error {
 		return fmt.Errorf("error making HTTP request to %q: %w", url, err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s returned HTTP status %s", url, resp.Status)
 	}
+
+    resp.Body = io.NopCloser(io.TeeReader(resp.Body, &b))
+
+	k.Log.Debugf("loadJSON(): resp.Body: (%+v)", b.String())
 
 	err = json.NewDecoder(resp.Body).Decode(v)
 	if err != nil {
@@ -341,8 +370,13 @@ func (k *Kubernetes) loadJSON(url string, v interface{}) error {
 	return nil
 }
 
-func buildPodMetrics(summaryMetrics *summaryMetrics, podInfo []item, labelFilter filter.Filter, acc telegraf.Accumulator) {
+func buildPodMetrics(
+	summaryMetrics *summaryMetrics, podInfo []item, labelFilter filter.Filter,
+	acc telegraf.Accumulator, log telegraf.Logger, convert bool) {
+
 	for _, pod := range summaryMetrics.Pods {
+
+		var converted string
 		podLabels := make(map[string]string)
 		containerImages := make(map[string]string)
 		for _, info := range podInfo {
@@ -352,6 +386,7 @@ func buildPodMetrics(summaryMetrics *summaryMetrics, podInfo []item, labelFilter
 				}
 				for k, v := range info.Metadata.Labels {
 					if labelFilter.Match(k) {
+						log.Debugf("buildPodMetrics(): filter matched: %s -> %s", k, v)
 						podLabels[k] = v
 					}
 				}
@@ -375,7 +410,12 @@ func buildPodMetrics(summaryMetrics *summaryMetrics, podInfo []item, labelFilter
 				}
 			}
 			for k, v := range podLabels {
-				tags[k] = v
+				if convert {
+					converted = invalid_sql_chars.ReplaceAllString(k, "_") 
+					tags[converted] = v
+				}else {
+					tags[k] = v
+				}
 			}
 			fields := make(map[string]interface{})
 			fields["cpu_usage_nanocores"] = container.CPU.UsageNanoCores
@@ -440,7 +480,7 @@ func urlToName(url string, log telegraf.Logger) string {
 
 	res := ipRegex.FindStringSubmatch(url)
 
-	log.Infof("urlToName(): ipRegex returned: %v", res)
+	log.Debugf("urlToName(): ipRegex returned: %v", res)
 	if res != nil {
 		if len(res) == 2 {
 			parts := strings.Split(res[1], ".")
@@ -449,7 +489,8 @@ func urlToName(url string, log telegraf.Logger) string {
 				parts[1],
 				parts[2],
 				parts[3])
-			log.Infof("urlToName(): found Node name: %v", res)
+			log.Debugf("urlToName(): found Node name: %v", res)
+
 			return name
 		}else {
 			return ""
