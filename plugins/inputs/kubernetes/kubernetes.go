@@ -38,16 +38,17 @@ const (
 
 // Kubernetes represents the config object for the plugin
 type Kubernetes struct {
-	URL               string          `toml:"url"`
-	BearerToken       string          `toml:"bearer_token"`
-	BearerTokenString string          `toml:"bearer_token_string" deprecated:"1.24.0;1.35.0;use 'BearerToken' with a file instead"`
-	NodeMetricName    string          `toml:"node_metric_name"`
-	LabelInclude      []string        `toml:"label_include"`
-	LabelExclude      []string        `toml:"label_exclude"`
-	ResponseTimeout   config.Duration `toml:"response_timeout"`
-	Log               telegraf.Logger `toml:"-"`
-	ConvertLabels     bool            `toml:"convert_labels"`
-	NodeLabels        bool            `toml:"node_labels"`
+	URL               string              `toml:"url"`
+	BearerToken       string              `toml:"bearer_token"`
+	BearerTokenString string              `toml:"bearer_token_string" deprecated:"1.24.0;1.35.0;use 'BearerToken' with a file instead"`
+	NodeMetricName    string              `toml:"node_metric_name"`
+	LabelInclude      []string            `toml:"label_include"`
+	LabelExclude      []string            `toml:"label_exclude"`
+	ResponseTimeout   config.Duration     `toml:"response_timeout"`
+	Log               telegraf.Logger     `toml:"-"`
+	ConvertLabels     bool                `toml:"convert_labels"`
+	NodeLabels        bool                `toml:"node_labels"`
+	NodeInfoMap       map[string]NodeInfo `toml:"node_info"`
 
 	tls.ClientConfig
 
@@ -56,15 +57,14 @@ type Kubernetes struct {
 }
 
 type NodeInfo struct {
-	Node *v1.Node
+	Name string
 	URL string
 	Labels map[string]string
 }
 
-func newNodeInfo(node *v1.Node, url string, labels map[string]string) NodeInfo {
+func newNodeInfo(name string, url string, labels map[string]string) NodeInfo {
 
-	n := NodeInfo{Node: node, URL: url, Labels: labels}
-
+	n := NodeInfo{Name: name, URL: url, Labels: labels}
 	return n
 }
 
@@ -106,12 +106,7 @@ func (k *Kubernetes) Init() error {
 
 func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
 
-	nodes, err := getNodes()
-	if err != nil {
-		return err
-	}
-
-	nodeInfoMap, err := getNodeInfoMap(nodes, k.Log)
+	err := GetNodeInfoMap(k)
 
 	if err != nil {
 		return err
@@ -120,7 +115,7 @@ func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
 	if k.URL != "" {
 		k.Log.Debugf("k.URL: %s", k.URL)
 		name := urlToName(k.URL, k.Log)
-		node, ok := nodeInfoMap[name]
+		node, ok := k.NodeInfoMap[name]
 		if ok {
 			labels := node.Labels
 			acc.AddError(k.gatherSummary(k.URL, labels, acc, k.Log))
@@ -135,7 +130,7 @@ func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
 
 	var wg sync.WaitGroup
 
-	for _, ni := range nodeInfoMap {
+	for _, ni := range k.NodeInfoMap {
 		wg.Add(1)
 		go func(url string) {
 			defer wg.Done()
@@ -147,52 +142,47 @@ func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
-func getNodes() (*v1.NodeList, error) {
+func GetNodeInfoMap(k *Kubernetes) (error) {
+
+	k.NodeInfoMap = make(map[string]NodeInfo)
 
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	nodes, err := client.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
 
 	if err != nil {
 		//panic(err.Error())
-		return nil, err
+		return err
 	}
-	return nodes, nil
-}
 
-func getNodeInfoMap(nl *v1.NodeList, log telegraf.Logger) (map[string]NodeInfo, error) {
-
-	nodeInfoMap := make(map[string]NodeInfo)
-
-	for i := range nl.Items {
-		n := &nl.Items[i]
+	for i := range nodes.Items {
+		n := &nodes.Items[i]
 		name := n.Name
-		log.Debugf("getNodeInfoList(), node: %s", name)
-
+		k.Log.Debugf("getNodeInfoList(), node: %s", name)
 		address := getNodeAddress(n.Status.Addresses)
 		if address == "" {
-			log.Warnf("Unable to node addresses for Node %q", n.Name)
+			k.Log.Warnf("Unable to get node addresses for Node %q", n.Name)
 			continue
 		}
+
 		nodeurl := "https://"+address+":10250"
 		labels := n.GetLabels()
-		log.Debugf("getNodeInfoList(), %d labels found", len(labels))
-		for k, v := range labels {
-			log.Debugf("getNodeInfoList(): label: %s -> %s", k, v)
+		k.Log.Debugf("getNodeInfoList(), %d labels found", len(labels))
+		for lk, lv := range labels {
+			k.Log.Debugf("getNodeInfoList(): label: %s -> %s", lk, lv)
 		}
-		ni := newNodeInfo(n, nodeurl, labels)
-		nodeInfoMap[name] = ni
+		ni := newNodeInfo(name, nodeurl, labels)
+		k.NodeInfoMap[name] = ni
 	}
-
-	return nodeInfoMap, nil
+	return nil
 }
 
 // Prefer internal addresses, if none found, use ExternalIP
@@ -313,7 +303,7 @@ func (k *Kubernetes) gatherPodInfo(baseURL string) ([]item, error) {
 
 func (k *Kubernetes) loadJSON(url string, v interface{}) error {
 	var req, err = http.NewRequest("GET", url, nil)
-    var b bytes.Buffer
+	var b bytes.Buffer
 
 	if err != nil {
 		return err
@@ -358,7 +348,7 @@ func (k *Kubernetes) loadJSON(url string, v interface{}) error {
 		return fmt.Errorf("%s returned HTTP status %s", url, resp.Status)
 	}
 
-    resp.Body = io.NopCloser(io.TeeReader(resp.Body, &b))
+	resp.Body = io.NopCloser(io.TeeReader(resp.Body, &b))
 
 	k.Log.Debugf("loadJSON(): resp.Body: (%+v)", b.String())
 
