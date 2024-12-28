@@ -105,7 +105,6 @@ func (k *Kubernetes) Init() error {
 func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
 
 	nodeInfoMap := make(map[string]NodeInfo)
-
 	kube_svc_host := os.Getenv("KUBERNETES_SERVICE_HOST")
 
 	if kube_svc_host != "" {
@@ -116,7 +115,6 @@ func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
 		}
 
 		nodeInfoMap, err = getNodeInfoMap(nodes, k.Log)
-
 		if err != nil {
 			return err
 		}
