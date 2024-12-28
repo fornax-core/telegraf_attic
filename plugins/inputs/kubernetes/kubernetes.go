@@ -9,11 +9,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 	"regexp"
-	"sync"
-	"bytes"
-	"io"
 
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,8 +27,10 @@ import (
 
 //go:embed sample.conf
 var sampleConfig string
-var ipRegex = regexp.MustCompile("https://([0-9.]+):[0-9]+")
 var invalid_sql_chars, _ = regexp.Compile(`[^_a-z0-9]+`)
+var urlToNodeLabels = make(map[string]map[string]string)
+var convertLabels bool
+var nodeLabels bool
 
 const (
 	defaultServiceAccountPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -55,16 +55,7 @@ type Kubernetes struct {
 	httpClient  *http.Client
 }
 
-type NodeInfo struct {
-	Node *v1.Node
-	URL string
-	Labels map[string]string
-}
-
-func newNodeInfo(node *v1.Node, url string, labels map[string]string) NodeInfo {
-	n := NodeInfo{Node: node, URL: url, Labels: labels}
-	return n
-}
+// var LabelsURLMap map[string]string
 
 func (*Kubernetes) SampleConfig() string {
 	return sampleConfig
@@ -92,110 +83,94 @@ func (k *Kubernetes) Init() error {
 
 	if k.ConvertLabels {
 		k.Log.Debugf("k.ConvertLabels true")
+		convertLabels = true
 	}
 
 	if k.NodeLabels {
 		k.Log.Debugf("k.NodeLabels true")
+		nodeLabels = true
 	}
 
 	k.Log.Debugf("k.Init() k = %+v", k)
+
 	return nil
 }
 
 func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
 
-	nodeInfoMap := make(map[string]NodeInfo)
-	kube_svc_host := os.Getenv("KUBERNETES_SERVICE_HOST")
-
-	if kube_svc_host != "" {
-
-		nodes, err := getNodes()
-		if err != nil {
-			return err
-		}
-
-		nodeInfoMap, err = getNodeInfoMap(nodes, k.Log)
-		if err != nil {
-			return err
-		}
-	}
-
 	if k.URL != "" {
-		k.Log.Debugf("k.URL: %s", k.URL)
-		name := urlToName(k.URL, k.Log)
-		node, ok := nodeInfoMap[name]
-		if ok {
-			labels := node.Labels
-			acc.AddError(k.gatherSummary(k.URL, labels, acc, k.Log))
-		}else {
-			labels := make(map[string]string)
-			acc.AddError(k.gatherSummary(k.URL, labels, acc, k.Log))
+		_, err := getNodeURLs(k.Log)
+		if err != nil {
+			return err
 		}
+		k.Log.Debug("Gather -> gatherSummary")
+		acc.AddError(k.gatherSummary(k.URL, acc))
 		return nil
-	}else {
-		k.Log.Info("k.URL is empty")
 	}
 
 	var wg sync.WaitGroup
+	nodeBaseURLs, err := getNodeURLs(k.Log)
+	if err != nil {
+		return err
+	}
 
-	for _, ni := range nodeInfoMap {
+	for _, url := range nodeBaseURLs {
 		wg.Add(1)
 		go func(url string) {
 			defer wg.Done()
-			acc.AddError(k.gatherSummary(ni.URL, ni.Labels, acc, k.Log))
-		}(ni.URL)
+			acc.AddError(k.gatherSummary(url, acc))
+		}(url)
 	}
 	wg.Wait()
 
 	return nil
 }
 
-func getNodes() (*v1.NodeList, error) {
+func getNodeURLs(log telegraf.Logger) ([]string, error) {
 
-	cfg, err := rest.InClusterConfig()
-	if err != nil {
-		return nil, err
-	}
+	kube_svc_host := os.Getenv("KUBERNETES_SERVICE_HOST")
+	log.Debugf("Got KUBERNETES_SERVICE_HOST: %s, running in cluster\n", kube_svc_host)
+	if kube_svc_host != "" {
 
-	client, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	nodes, err := client.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-
-	if err != nil {
-		//panic(err.Error())
-		return nil, err
-	}
-	return nodes, nil
-}
-
-func getNodeInfoMap(nl *v1.NodeList, log telegraf.Logger) (map[string]NodeInfo, error) {
-
-	nodeInfoMap := make(map[string]NodeInfo)
-
-	for i := range nl.Items {
-		n := &nl.Items[i]
-		name := n.Name
-		log.Debugf("getNodeInfoList(), node: %s", name)
-
-		address := getNodeAddress(n.Status.Addresses)
-		if address == "" {
-			log.Warnf("Unable to node addresses for Node %q", n.Name)
-			continue
+		cfg, err := rest.InClusterConfig()
+		if err != nil {
+			return nil, err
 		}
-		nodeurl := "https://"+address+":10250"
-		labels := n.GetLabels()
-		log.Debugf("getNodeInfoList(), %d labels found", len(labels))
-		for k, v := range labels {
-			log.Debugf("getNodeInfoList(): label: %s -> %s", k, v)
+		client, err := kubernetes.NewForConfig(cfg)
+		if err != nil {
+			return nil, err
 		}
-		ni := newNodeInfo(n, nodeurl, labels)
-		nodeInfoMap[name] = ni
-	}
 
-	return nodeInfoMap, nil
+		nodes, err := client.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		urlToNodeLabels = map[string]map[string]string{}
+
+		nodeUrls := make([]string, 0, len(nodes.Items))
+		for i := range nodes.Items {
+			n := &nodes.Items[i]
+
+			address := getNodeAddress(n.Status.Addresses)
+			log.Debugf("Got node address: %s\n", address)
+			if address == "" {
+				log.Warnf("Unable to node addresses for Node %q", n.Name)
+				continue
+			}
+			url := "https://"+address+":10250"
+			log.Debugf("URL: %s\n", url)
+			labels := n.GetLabels()
+			log.Debugf("(%d) Labels: %+v\n", len(labels), labels)
+			nodeUrls = append(nodeUrls, url)
+			urlToNodeLabels[url] = labels	
+		}
+		return nodeUrls, nil
+	}else {
+		log.Debugf("NO KUBERNETES_SERVICE_HOST, out of cluster\n")
+		nodeUrls := make([]string, 0)
+		return nodeUrls, nil
+	}
 }
 
 // Prefer internal addresses, if none found, use ExternalIP
@@ -214,21 +189,20 @@ func getNodeAddress(addresses []v1.NodeAddress) string {
 	return ""
 }
 
-func (k *Kubernetes) gatherSummary(baseURL string, labels map[string]string, acc telegraf.Accumulator, log telegraf.Logger) error {
+func (k *Kubernetes) gatherSummary(baseURL string, acc telegraf.Accumulator) error {
 	summaryMetrics := &summaryMetrics{}
 	err := k.loadJSON(baseURL+"/stats/summary", summaryMetrics)
 	if err != nil {
 		return err
 	}
-	log.Debugf("gatherSummary(): loadJSON(%s)", (baseURL+"/stats/summary"))
 
 	podInfos, err := k.gatherPodInfo(baseURL)
 	if err != nil {
 		return err
 	}
 	buildSystemContainerMetrics(summaryMetrics, acc)
-	buildNodeMetrics(summaryMetrics, labels, k.labelFilter, acc, k.NodeMetricName, log, k.ConvertLabels)
-	buildPodMetrics(summaryMetrics, podInfos, k.labelFilter, acc, log, k.ConvertLabels)
+	buildNodeMetrics(summaryMetrics, acc, k.NodeMetricName, k.labelFilter, baseURL, k.Log)
+	buildPodMetrics(summaryMetrics, podInfos, k.labelFilter, acc)
 	return nil
 }
 
@@ -254,29 +228,29 @@ func buildSystemContainerMetrics(summaryMetrics *summaryMetrics, acc telegraf.Ac
 	}
 }
 
-func buildNodeMetrics(summaryMetrics *summaryMetrics,
-						labels map[string]string,
-						labelFilter filter.Filter,
-						acc telegraf.Accumulator,
-						metricName string, log telegraf.Logger,
-						convert bool) {
+func buildNodeMetrics(summaryMetrics *summaryMetrics, acc telegraf.Accumulator,
+	metricName string, labelFilter filter.Filter,
+	url string, log telegraf.Logger) {
 
 	var converted string
 
 	tags := map[string]string{
 		"node_name": summaryMetrics.Node.NodeName,
 	}
-	log.Debugf("buildNodeMetrics(): got nodename: %s from summaryMetrics", summaryMetrics.Node.NodeName)
 
-	for k, v := range labels {
-		log.Debugf("buildNodeMetrics(): label: %s -> %s", k, v)
-		if labelFilter.Match(k) {
-			log.Debugf("buildNodeMetrics(): filter matched: %s -> %s", k, v)
-			if convert {
-				converted = invalid_sql_chars.ReplaceAllString(k, "_") 
-				tags[converted] = v
-			}else {
-				tags[k] = v
+	if nodeLabels {
+		labels := urlToNodeLabels[url]
+		log.Debug("nodeLabels true")	
+		for k, v := range labels {
+			log.Debugf("buildNodeMetrics(): label: %s -> %s", k, v)
+			if labelFilter.Match(k) {
+				log.Debugf("buildNodeMetrics(): filter matched: %s -> %s", k, v)
+				if convertLabels {
+					converted = invalid_sql_chars.ReplaceAllString(k, "_") 
+					tags[converted] = v
+				}else {
+					tags[k] = v
+				}
 			}
 		}
 	}
@@ -316,8 +290,6 @@ func (k *Kubernetes) gatherPodInfo(baseURL string) ([]item, error) {
 
 func (k *Kubernetes) loadJSON(url string, v interface{}) error {
 	var req, err = http.NewRequest("GET", url, nil)
-    var b bytes.Buffer
-
 	if err != nil {
 		return err
 	}
@@ -356,14 +328,9 @@ func (k *Kubernetes) loadJSON(url string, v interface{}) error {
 		return fmt.Errorf("error making HTTP request to %q: %w", url, err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s returned HTTP status %s", url, resp.Status)
 	}
-
-    resp.Body = io.NopCloser(io.TeeReader(resp.Body, &b))
-
-	k.Log.Debugf("loadJSON(): resp.Body: (%+v)", b.String())
 
 	err = json.NewDecoder(resp.Body).Decode(v)
 	if err != nil {
@@ -373,13 +340,11 @@ func (k *Kubernetes) loadJSON(url string, v interface{}) error {
 	return nil
 }
 
-func buildPodMetrics(
-	summaryMetrics *summaryMetrics, podInfo []item, labelFilter filter.Filter,
-	acc telegraf.Accumulator, log telegraf.Logger, convert bool) {
-
+func buildPodMetrics(summaryMetrics *summaryMetrics, podInfo []item, labelFilter filter.Filter, acc telegraf.Accumulator) {
 	for _, pod := range summaryMetrics.Pods {
 
 		var converted string
+
 		podLabels := make(map[string]string)
 		containerImages := make(map[string]string)
 		for _, info := range podInfo {
@@ -389,7 +354,6 @@ func buildPodMetrics(
 				}
 				for k, v := range info.Metadata.Labels {
 					if labelFilter.Match(k) {
-						log.Debugf("buildPodMetrics(): filter matched: %s -> %s", k, v)
 						podLabels[k] = v
 					}
 				}
@@ -413,7 +377,7 @@ func buildPodMetrics(
 				}
 			}
 			for k, v := range podLabels {
-				if convert {
+				if convertLabels {
 					converted = invalid_sql_chars.ReplaceAllString(k, "_") 
 					tags[converted] = v
 				}else {
@@ -477,28 +441,4 @@ func init() {
 			LabelExclude: []string{"*"},
 		}
 	})
-}
-
-func urlToName(url string, log telegraf.Logger) string {
-
-	res := ipRegex.FindStringSubmatch(url)
-
-	log.Debugf("urlToName(): ipRegex returned: %v", res)
-	if res != nil {
-		if len(res) == 2 {
-			parts := strings.Split(res[1], ".")
-			name := fmt.Sprintf("ip-%s-%s-%s-%s.ec2.internal",
-				parts[0],
-				parts[1],
-				parts[2],
-				parts[3])
-			log.Debugf("urlToName(): found Node name: %v", res)
-
-			return name
-		}else {
-			return ""
-		}
-	}else {
-		return ""
-	}
 }

@@ -88,6 +88,14 @@ See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
   # tls_key = /path/to/keyfile
   ## Use TLS but skip chain & host verification
   # insecure_skip_verify = false
+
+  ## Node labels will be added as tags using the same include
+  ## exlude filter as Pod labels.
+  # node_labels = false
+
+  ## Convert characters in label names that don't match the regex [a-zA-Z0-9.]
+  ## into underbars, so the field names don't require quoting in SQL queries.
+  # convert_labels = false
 ```
 
 ## DaemonSet
