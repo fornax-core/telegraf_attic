@@ -35,7 +35,7 @@ func TestKubernetesStats(t *testing.T) {
 
 	labelFilter, err := filter.NewIncludeExcludeFilter([]string{"app", "superkey"}, nil)
 	require.NoError(t, err)
-    tlogger := logger.New("plugin", "kubernetes", "kubernetes")
+	tlogger := logger.New("plugin", "kubernetes", "kubernetes")
 
 
 	k := &Kubernetes{
