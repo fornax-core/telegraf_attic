@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/influxdata/telegraf/logger"
 	"github.com/influxdata/telegraf/filter"
 	"github.com/influxdata/telegraf/testutil"
 	"github.com/stretchr/testify/require"
@@ -34,11 +35,14 @@ func TestKubernetesStats(t *testing.T) {
 
 	labelFilter, err := filter.NewIncludeExcludeFilter([]string{"app", "superkey"}, nil)
 	require.NoError(t, err)
+    tlogger := logger.New("plugin", "kubernetes", "kubernetes")
+
 
 	k := &Kubernetes{
 		URL:            ts.URL,
 		labelFilter:    labelFilter,
 		NodeMetricName: "kubernetes_node",
+		Log:            tlogger,
 	}
 
 	var acc testutil.Accumulator

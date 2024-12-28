@@ -62,9 +62,7 @@ type NodeInfo struct {
 }
 
 func newNodeInfo(node *v1.Node, url string, labels map[string]string) NodeInfo {
-
 	n := NodeInfo{Node: node, URL: url, Labels: labels}
-
 	return n
 }
 
@@ -106,15 +104,22 @@ func (k *Kubernetes) Init() error {
 
 func (k *Kubernetes) Gather(acc telegraf.Accumulator) error {
 
-	nodes, err := getNodes()
-	if err != nil {
-		return err
-	}
+	nodeInfoMap := make(map[string]NodeInfo)
 
-	nodeInfoMap, err := getNodeInfoMap(nodes, k.Log)
+	kube_svc_host := os.Getenv("KUBERNETES_SERVICE_HOST")
 
-	if err != nil {
-		return err
+	if kube_svc_host != "" {
+
+		nodes, err := getNodes()
+		if err != nil {
+			return err
+		}
+
+		nodeInfoMap, err = getNodeInfoMap(nodes, k.Log)
+
+		if err != nil {
+			return err
+		}
 	}
 
 	if k.URL != "" {
