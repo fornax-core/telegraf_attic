@@ -31,6 +31,7 @@ var invalid_sql_chars, _ = regexp.Compile(`[^_a-z0-9]+`)
 var urlToNodeLabels = make(map[string]map[string]string)
 var convertLabels bool
 var nodeLabels bool
+var external_ipv4 bool
 
 const (
 	defaultServiceAccountPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -48,6 +49,7 @@ type Kubernetes struct {
 	Log               telegraf.Logger `toml:"-"`
 	ConvertLabels     bool            `toml:"convert_labels"`
 	NodeLabels        bool            `toml:"node_labels"`
+	NodeExternalIPv4  bool            `toml:"node_external_ipv4"`
 
 	tls.ClientConfig
 
@@ -55,7 +57,10 @@ type Kubernetes struct {
 	httpClient  *http.Client
 }
 
-// var LabelsURLMap map[string]string
+type Addresses struct {
+	InternalIPv4 string
+	ExternalIPv4 string
+}
 
 func (*Kubernetes) SampleConfig() string {
 	return sampleConfig
@@ -89,6 +94,11 @@ func (k *Kubernetes) Init() error {
 	if k.NodeLabels {
 		k.Log.Debugf("k.NodeLabels true")
 		nodeLabels = true
+	}
+
+	if k.NodeExternalIPv4 {
+		k.Log.Debugf("k.NodeExternalIP true")
+		external_ipv4 = true
 	}
 
 	k.Log.Debugf("k.Init() k = %+v", k)
@@ -152,17 +162,23 @@ func getNodeURLs(log telegraf.Logger) ([]string, error) {
 		for i := range nodes.Items {
 			n := &nodes.Items[i]
 
-			address := getNodeAddress(n.Status.Addresses)
-			log.Debugf("Got node address: %s\n", address)
-			if address == "" {
+			addresses := getNodeAddresses(n.Status.Addresses, log)
+			if addresses.InternalIPv4 == "" {
 				log.Warnf("Unable to node addresses for Node %q", n.Name)
 				continue
 			}
-			url := "https://"+address+":10250"
-			log.Debugf("URL: %s\n", url)
-			labels := n.GetLabels()
-			log.Debugf("(%d) Labels: %+v\n", len(labels), labels)
+			log.Debugf("Got node address: %s\n", addresses.InternalIPv4)
+			url := "https://"+addresses.InternalIPv4+":10250"
+			log.Debugf("Make kublet URL: %s\n", url)
+			labels := make(map[string]string)
+			labels = n.GetLabels()
 			nodeUrls = append(nodeUrls, url)
+			if addresses.ExternalIPv4 != "" {
+				if external_ipv4 {
+					labels["node_external_ipv4"] = addresses.ExternalIPv4
+					log.Debugf("Got node external IPv4: %s\n", addresses.ExternalIPv4)
+				}
+			}
 			urlToNodeLabels[url] = labels	
 		}
 		return nodeUrls, nil
@@ -173,20 +189,26 @@ func getNodeURLs(log telegraf.Logger) ([]string, error) {
 	}
 }
 
-// Prefer internal addresses, if none found, use ExternalIP
-func getNodeAddress(addresses []v1.NodeAddress) string {
-	extAddresses := make([]string, 0)
-	for _, addr := range addresses {
-		if addr.Type == v1.NodeInternalIP {
-			return addr.Address
+func getNodeAddresses(addresses []v1.NodeAddress, log telegraf.Logger) Addresses {
+	addys := Addresses{}
+    extAddresses := make([]string, 0)
+    for _, addr := range addresses {
+        if addr.Type == v1.NodeInternalIP {
+			if addys.InternalIPv4 != "" {
+				addys.InternalIPv4 = addr.Address
+			}else {
+				addys.InternalIPv4 = addr.Address
+			}
+        }
+		if addr.Type == v1.NodeExternalIP {
+	        extAddresses = append(extAddresses, addr.Address)
 		}
-		extAddresses = append(extAddresses, addr.Address)
-	}
+    }
 
-	if len(extAddresses) > 0 {
-		return extAddresses[0]
-	}
-	return ""
+    if len(extAddresses) > 0 {
+		addys.ExternalIPv4 = extAddresses[0]
+    }
+    return addys
 }
 
 func (k *Kubernetes) gatherSummary(baseURL string, acc telegraf.Accumulator) error {
@@ -239,8 +261,10 @@ func buildNodeMetrics(summaryMetrics *summaryMetrics, acc telegraf.Accumulator,
 	}
 
 	if nodeLabels {
-		labels := urlToNodeLabels[url]
 		log.Debug("nodeLabels true")	
+		labels := urlToNodeLabels[url]
+		log.Debugf("%d lables for url: %s\n", len(labels), url)	
+		log.Debugf("Labels now: %+v\n", labels)	
 		for k, v := range labels {
 			log.Debugf("buildNodeMetrics(): label: %s -> %s", k, v)
 			if labelFilter.Match(k) {
