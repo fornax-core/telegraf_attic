@@ -214,7 +214,7 @@ func (k *Kubernetes) gatherSummary(baseURL string, acc telegraf.Accumulator) err
 	}
 	buildSystemContainerMetrics(summaryMetrics, acc)
 	k.buildNodeMetrics(baseURL, summaryMetrics, acc)
-	buildPodMetrics(summaryMetrics, podInfos, k.labelFilter, acc)
+	k.buildPodMetrics(summaryMetrics, podInfos, acc)
 	return nil
 }
 
@@ -350,7 +350,10 @@ func (k *Kubernetes) loadJSON(url string, v interface{}) error {
 	return nil
 }
 
-func buildPodMetrics(summaryMetrics *summaryMetrics, podInfo []item, labelFilter filter.Filter, acc telegraf.Accumulator) {
+func (k *Kubernetes) buildPodMetrics(summaryMetrics *summaryMetrics, podInfo []item, acc telegraf.Accumulator) {
+
+	var converted string
+
 	for _, pod := range summaryMetrics.Pods {
 		podLabels := make(map[string]string)
 		containerImages := make(map[string]string)
@@ -359,9 +362,9 @@ func buildPodMetrics(summaryMetrics *summaryMetrics, podInfo []item, labelFilter
 				for _, v := range info.Spec.Containers {
 					containerImages[v.Name] = v.Image
 				}
-				for k, v := range info.Metadata.Labels {
-					if labelFilter.Match(k) {
-						podLabels[k] = v
+				for mk, mv := range info.Metadata.Labels {
+					if k.labelFilter.Match(mk) {
+						podLabels[mk] = mv
 					}
 				}
 			}
@@ -374,18 +377,24 @@ func buildPodMetrics(summaryMetrics *summaryMetrics, podInfo []item, labelFilter
 				"container_name": container.Name,
 				"pod_name":       pod.PodRef.Name,
 			}
-			for k, v := range containerImages {
-				if k == container.Name {
-					tags["image"] = v
-					tok := strings.Split(v, ":")
+			for ik, iv := range containerImages {
+				if ik == container.Name {
+					tags["image"] = iv
+					tok := strings.Split(iv, ":")
 					if len(tok) == 2 {
 						tags["version"] = tok[1]
 					}
 				}
 			}
-			for k, v := range podLabels {
-				tags[k] = v
+			for pk, pv := range podLabels {
+				if k.ConvertLabels {
+					converted = invalid_sql_chars.ReplaceAllString(pk, "_") 
+					tags[converted] = pv
+				}else {
+					tags[pk] = pv
+				}
 			}
+
 			fields := make(map[string]interface{})
 			fields["cpu_usage_nanocores"] = container.CPU.UsageNanoCores
 			fields["cpu_usage_core_nanoseconds"] = container.CPU.UsageCoreNanoSeconds
@@ -410,8 +419,8 @@ func buildPodMetrics(summaryMetrics *summaryMetrics, podInfo []item, labelFilter
 				"namespace":   pod.PodRef.Namespace,
 				"volume_name": volume.Name,
 			}
-			for k, v := range podLabels {
-				tags[k] = v
+			for pk, pv := range podLabels {
+				tags[pk] = pv
 			}
 			fields := make(map[string]interface{})
 			fields["available_bytes"] = volume.AvailableBytes
@@ -425,8 +434,8 @@ func buildPodMetrics(summaryMetrics *summaryMetrics, podInfo []item, labelFilter
 			"pod_name":  pod.PodRef.Name,
 			"namespace": pod.PodRef.Namespace,
 		}
-		for k, v := range podLabels {
-			tags[k] = v
+		for pk, pv := range podLabels {
+			tags[pk] = pv
 		}
 		fields := make(map[string]interface{})
 		fields["rx_bytes"] = pod.Network.RXBytes
