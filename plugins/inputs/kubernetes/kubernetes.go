@@ -27,7 +27,7 @@ import (
 
 //go:embed sample.conf
 var sampleConfig string
-var invalid_sql_chars, _ = regexp.Compile(`[^_a-z0-9]+`)
+var invalid_sql_chars, _ = regexp.Compile(`[^_a-zA-Z0-9]+`)
 
 const (
 	defaultServiceAccountPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
