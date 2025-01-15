@@ -27,7 +27,7 @@ import (
 
 //go:embed sample.conf
 var sampleConfig string
-var invalid_sql_chars, _ = regexp.Compile(`[^_a-z0-9]+`)
+var invalid_sql_chars, _ = regexp.Compile(`[^_a-zA-Z0-9]+`)
 var urlToNodeLabels = make(map[string]map[string]string)
 var convertLabels bool
 var nodeLabels bool

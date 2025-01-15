@@ -89,13 +89,19 @@ See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
   ## Use TLS but skip chain & host verification
   # insecure_skip_verify = false
 
-  ## Node labels will be added as tags using the same include
-  ## exlude filter as Pod labels.
+  ## Node labels will be added as tags using the same include exlude filter
+  ## as Pod labels. In AWS configuring this to true and adding
+  ## "node.kubernetes.io/instance-type" to the label_include list, will provide
+  ## the instance type name, such as "t3a.large".
   # node_labels = false
 
-  ## Convert characters in label names that don't match the regex [a-zA-Z0-9.]
-  ## into underbars, so the field names don't require quoting in SQL queries.
+  ## Convert characters in label names that don't match the regex [^_a-zA-Z0-9]
+  ## into underbars, so that db field names don't require quoting in SQL queries.
   # convert_labels = false
+
+  ## If an external IPv4 address is configured, add that as the node label
+  ## external_ipv4_address.
+  # node_external_ipv4
 ```
 
 ## DaemonSet
